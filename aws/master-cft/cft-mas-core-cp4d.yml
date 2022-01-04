@@ -1,0 +1,514 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template to create Bootnode used for deploying MAS on OpenShift
+Parameters:
+  VpcCidr:
+    Description: CIDR that will be used for new VPC created for OCP cluster.
+    Type: String
+    Default: 10.0.0.0/16
+  MasterSubnetCidr1:
+    Description: CIDR that will be used for new master subnet-1.
+    Type: String
+    Default: 10.0.0.0/20
+  MasterSubnetCidr2:
+    Description: CIDR that will be used for new master subnet-2.
+    Type: String
+    Default: 10.0.16.0/20
+  MasterSubnetCidr3:
+    Description: CIDR that will be used for new master subnet-3.
+    Type: String
+    Default: 10.0.32.0/20
+  WorkerSubnetCidr1:
+    Description: CIDR that will be used for new worker subnet-1.
+    Type: String
+    Default: 10.0.128.0/20
+  WorkerSubnetCidr2:
+    Description: CIDR that will be used for new worker subnet-2.
+    Type: String
+    Default: 10.0.144.0/20
+  WorkerSubnetCidr3:
+    Description: CIDR that will be used for new worker subnet-3.
+    Type: String
+    Default: 10.0.160.0/20
+  PublicHostedZone:
+    Description: Public hosted zone to use. e.g. mas4aws.myorg.com
+    Type: AWS::Route53::HostedZone::Id
+  ClusterSize:
+    Description: OCP cluster size.
+    Type: String
+    Default: small
+    AllowedValues:
+      - small
+      - medium
+      - large
+  EntitledRegistryKey:
+    Description: Entitled registry key.
+    Type: String
+  OpenShiftPullSecret:
+    Description: Pull secret to download OpenShift operator images. JSON string can be pasted as is.
+    Type: String
+  MASLicenseUrl:
+    Description: HTTP or S3 URL of MAS license file. e.g. s3://masocp-license/entitlement.lic
+    Type: String
+  SSHKey:
+    Type: 'AWS::EC2::KeyPair::KeyName'
+    Description: SSH key to you want to use to connect to EC2 instances in the cluster.
+  SLSEndpointUrl:
+    Description: SLS endpoint URL. Must be accessible to the deployment.
+    Type: String
+  SLSRegistrationKey:
+    Description: SLS registration key, normally available in 'LicenseService' instance created in the SLS deployed namespace.
+    Type: String
+  SLSPublicCertificateUrl:
+    Description: HTTP or S3 URL of SLS public certificate file. e.g. s3://masocp-license/slscertificate.crt
+    Type: String
+  BASEndpointUrl:
+    Description: BAS endpoint URL. Must be accessible to the deployment.
+    Type: String
+  BASAPIKey:
+    Description: BAS API key, normally available in OCP secret 'bas-api-key' in the BAS deployed namespace.
+    Type: String
+  BASSegmentKey:
+    Description: BAS segment key, normally available in OCP secret 'segment-key-secret' in the BAS deployed namespace.
+    Type: String
+  BASPublicCertificateUrl:
+    Description: HTTP or S3 URL of BAS public certificate file. e.g. s3://masocp-license/bascertificate.crt
+    Type: String
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: New VPC for OCP Cluster
+        Parameters:
+          - VpcCidr
+          - MasterSubnetCidr1
+          - MasterSubnetCidr2
+          - MasterSubnetCidr3
+          - WorkerSubnetCidr1
+          - WorkerSubnetCidr2
+          - WorkerSubnetCidr3
+      - Label:
+          default: Cluster Configuration
+        Parameters:
+          - PublicHostedZone
+          - ClusterSize
+          - SSHKey
+      - Label:
+          default: Keys and Licenses
+        Parameters:
+          - EntitledRegistryKey
+          - OpenShiftPullSecret
+          - MASLicenseUrl
+      - Label:
+          default: Existing SLS details, if kept empty a new SLS instance will be deployed
+        Parameters:
+          - SLSEndpointUrl
+          - SLSRegistrationKey
+          - SLSPublicCertificateUrl
+      - Label:
+          default: Existing BAS details, if kept empty a new BAS instance will be deployed
+        Parameters:
+          - BASEndpointUrl
+          - BASAPIKey
+          - BASSegmentKey
+          - BASPublicCertificateUrl
+Mappings: 
+  RegionMap:
+    us-east-1: 
+      "HVM64": "ami-0ec6ccbb788208f23" 
+    us-east-2: 
+      "HVM64": "ami-0528d2a7a3b7da1ec"
+    us-west-2: 
+      "HVM64": "ami-024613903fce03596"
+    ap-south-1: 
+      "HVM64": "ami-0cebcaf11fd74077e"
+Resources:
+  DeployWaitHandle:
+    Type: 'AWS::CloudFormation::WaitConditionHandle'
+  DeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: 
+        'Fn::Join':
+          - '-'
+          - - 'masocp-deploy-role'
+            - !GetAtt CallLambdaRandomizer.Lower_RandomString
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: EmbeddedInlinePolicy1
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - iam:CreatePolicy
+                  - iam:CreateUser
+                  - iam:AttachUserPolicy
+                  - iam:CreateAccessKey
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                  - s3:DeleteBucket
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                  - ses:ListIdentities
+                  - route53:ListHostedZones
+                Resource: '*'
+      Path: /
+  DeploymentRoleProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: 
+      InstanceProfileName: 
+        'Fn::Join':
+          - '-'
+          - - 'masocp-deploy-instance-profile'
+            - !GetAtt CallLambdaRandomizer.Lower_RandomString
+      Path: /
+      Roles: 
+       - !Ref DeploymentRole
+  LambdaRole: 
+    Type: "AWS::IAM::Role"
+    Properties: 
+      RoleName: 
+        'Fn::Join':
+          - '-'
+          - - 'masocp-lambda-role'
+            - !Ref "AWS::Region"
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement: 
+          - Effect: "Allow"
+            Principal: 
+              Service: 
+                - "lambda.amazonaws.com"
+            Action: 
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: EmbeddedInlinePolicy2
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement: 
+            - Effect: "Allow"
+              Action: 
+                - "logs:CreateLogStream"
+                - "logs:PutLogEvents"
+                - "logs:CreateLogGroup"
+                - "route53:GetHostedZone"
+                - "ec2:DescribeVpcs"
+                - "ec2:DescribeSubnets"
+              Resource: "*"
+      Path: "/"
+  LambdaFunctionRandomizer:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn 
+      Runtime: python3.7
+      Tags:
+        - Key : Name
+          Value : RandomizerLambda
+      Code:
+        ZipFile: |
+          import boto3
+          import random
+          import string
+          import cfnresponse
+          def lambda_handler(event, context):
+              responseData = {}
+              try:
+                  string_characters = string.ascii_letters + string.digits
+                  number_characters = string.digits
+                  responseData['RandomString']  = ''.join(random.choice(string_characters) for i in range(int(event["ResourceProperties"]["length"])))
+                  responseData['RandomNumber']  = ''.join(random.choice(number_characters) for i in range(int(event["ResourceProperties"]["length"])))
+                  responseData['Lower_RandomString'] = responseData['RandomString'].lower()
+                  responseData['UpperRandomString'] = responseData['RandomString'].upper()
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+              except Exception as e:
+                  print("Exception Error : " + str(e))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData, "CustomResourcePhysicalID")
+  CallLambdaRandomizer:
+    Type: "Custom::CallLambdaRandomizer"
+    Properties:
+      ServiceToken: !GetAtt LambdaFunctionRandomizer.Arn
+      length: 6
+  LambdaFunctionGetHostedZoneName:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn 
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import boto3
+          import string
+          import cfnresponse
+          def lambda_handler(event, context):
+              responseData = {}
+              try:
+                  route53_client = boto3.client('route53', region_name=event["ResourceProperties"]["Region"])
+                  response = route53_client.get_hosted_zone(Id=event["ResourceProperties"]["ZoneId"])
+                  responseData['ZoneName'] = response['HostedZone']['Name'][:-1]
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+              except Exception as e:
+                  print("Exception Error : " + str(e))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData, "CustomResourcePhysicalID")
+  CallLambdaGetHostedZoneName:
+    Type: "Custom::CallLambdaGetHostedZoneName"
+    Properties:
+      ServiceToken: !GetAtt LambdaFunctionGetHostedZoneName.Arn
+      ZoneId: !Ref "PublicHostedZone"
+      Region: !Ref "AWS::Region"
+  DeploymentConfigBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Join
+        - '-'
+        - - 'masocp-bucket'
+          - !Ref "AWS::Region"
+          - !GetAtt CallLambdaRandomizer.Lower_RandomString
+      AccessControl: BucketOwnerFullControl
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  LambdaFunctionGetSubnetForBootnode:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.lambda_handler
+      Role: !GetAtt LambdaRole.Arn 
+      Runtime: python3.7
+      Code:
+        ZipFile: |
+          import boto3
+          import string
+          import cfnresponse
+          def lambda_handler(event, context):
+              responseData = {}
+              try:
+                  ec2_client = boto3.client('ec2', region_name=event["ResourceProperties"]["Region"])
+                  response = ec2_client.describe_vpcs()
+                  for vpc_response in response['Vpcs']:
+                    vpc_id = vpc_response['VpcId']
+                    is_default = vpc_response['IsDefault']
+                    if is_default == True:
+                      default_vpc_id = vpc_id
+                      break
+                  response = ec2_client.describe_subnets()
+                  for subnet_response in response['Subnets']:
+                    subnet_id = subnet_response['SubnetId']
+                    subnet_vpc_id = subnet_response['VpcId']
+                    az_id = subnet_response['AvailabilityZoneId']
+                    if subnet_vpc_id == default_vpc_id:
+                      if "az1" in az_id:
+                        responseData['DefaultVPCId'] = subnet_vpc_id
+                        responseData['DefaultVPCAz1SubnetId'] = subnet_id
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, responseData, "CustomResourcePhysicalID")
+              except Exception as e:
+                  print("Exception Error : " + str(e))
+                  cfnresponse.send(event, context, cfnresponse.FAILED, responseData, "CustomResourcePhysicalID")
+  CallLambdaFunctionGetSubnetForBootnode:
+    Type: "Custom::CallLambdaFunctionGetSubnetForBootnode"
+    Properties:
+      ServiceToken: !GetAtt LambdaFunctionGetSubnetForBootnode.Arn
+      Region: !Ref "AWS::Region"
+  BootnodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Bootnode
+      SecurityGroupIngress:
+      - IpProtocol: icmp
+        FromPort: 0
+        ToPort: 0
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+        CidrIp: 0.0.0.0/0
+      VpcId: !GetAtt CallLambdaFunctionGetSubnetForBootnode.DefaultVPCId
+      Tags:
+        - Key: Name
+          Value:
+            'Fn::Join':
+              - '-'
+              - - 'masocp-bootnode-sg'
+                - !GetAtt CallLambdaRandomizer.Lower_RandomString  
+  Bootnode:
+    Type: 'AWS::EC2::Instance'
+    Properties:
+      SubnetId: !GetAtt CallLambdaFunctionGetSubnetForBootnode.DefaultVPCAz1SubnetId
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", HVM64]
+      InstanceType: t2.micro
+      KeyName: !Ref "SSHKey"
+      SecurityGroupIds: 
+        - !Ref BootnodeSecurityGroup
+      IamInstanceProfile: !Ref DeploymentRoleProfile
+      UserData: !Base64 
+        'Fn::Join':
+          - ''
+          - - |
+              #!/bin/bash
+            - |
+              # Initiate the provisioning process
+            - 'ssh-keyscan github.ibm.com >> ~/.ssh/known_hosts;'
+            - 'cd /root;'
+            - 'git clone git@github.ibm.com:dwedge/mas-multicloud.git;'
+            - 'cd mas-multicloud;'
+            - 'find . -type f -name "*.sh" -exec chmod +x {} \;;'
+            - './init.sh "aws" "'
+            - !Ref "AWS::Region"
+            - '" "'
+            - !Ref "AWS::AccountId"
+            - '" "'
+            - !Ref "ClusterSize"
+            - '" "'
+            - !GetAtt CallLambdaRandomizer.Lower_RandomString
+            - '" "'
+            - !GetAtt CallLambdaGetHostedZoneName.ZoneName
+            - '" "'
+            - !Ref "VpcCidr"
+            - '" "'
+            - !Ref "MasterSubnetCidr1"
+            - '" "'
+            - !Ref "MasterSubnetCidr2"
+            - '" "'
+            - !Ref "MasterSubnetCidr3"
+            - '" "'
+            - !Ref "WorkerSubnetCidr1"
+            - '" "'
+            - !Ref "WorkerSubnetCidr2"
+            - '" "'
+            - !Ref "WorkerSubnetCidr3"
+            - '" "'
+            - !Ref "SSHKey"
+            - '" "'
+            - 'masocp-deploy-role-'
+            - !GetAtt CallLambdaRandomizer.Lower_RandomString
+            - '" "'
+            - 'cp4d=true'
+            - '" "'
+            - 'manage=false'
+            - '" "'
+            - 'managedapps='
+            - '" "'
+            - !Ref "DeployWaitHandle"
+            - '" "'
+            - !Ref "EntitledRegistryKey"
+            - '" '
+            - "'"
+            - !Ref "OpenShiftPullSecret"
+            - "' '"
+            - !Ref "MASLicenseUrl"
+            - "' '"
+            - !Ref "SLSEndpointUrl"
+            - "' '"
+            - !Ref "SLSRegistrationKey"
+            - "' '"
+            - !Ref "SLSPublicCertificateUrl"
+            - "' '"
+            - !Ref "BASEndpointUrl"
+            - "' '"
+            - !Ref "BASAPIKey"
+            - "' '"
+            - !Ref "BASSegmentKey"
+            - "' '"
+            - !Ref "BASPublicCertificateUrl"
+            - "' '"
+            - "' '"
+            - "' '"
+            - "' '"
+            - "' "
+            - '2>&1 | tee mas-provisioning.log; '
+      Tags:
+        - Key: Name
+          Value: 
+            'Fn::Join':
+              - '-'
+              - - 'masocp'
+                - !GetAtt CallLambdaRandomizer.Lower_RandomString
+                - 'bootnode'
+  DeployWaitCondition:
+    Type: 'AWS::CloudFormation::WaitCondition'
+    DependsOn: Bootnode
+    Properties:
+      Handle: !Ref "DeployWaitHandle" 
+      Timeout: 18000
+
+Outputs:
+  MASCloudAutomationVersion:
+    Description: Version of the MAS automated deployment on Cloud
+    Value: '1.0.0'
+  ClusterUniqueString:
+    Description: Unique string that is part of cluster resoutce names
+    Value: !GetAtt CallLambdaRandomizer.Lower_RandomString
+  BootnodeInstanceID:
+    Description: The Bootnode instance Id
+    Value: !Ref Bootnode
+  OpenShiftConsoleUrl:
+    Description: Url to login to OpenShift console
+    Value: 
+      'Fn::Join':
+        - ''
+        - - 'https://console-openshift-console.apps.masocp-'
+          - !GetAtt CallLambdaRandomizer.Lower_RandomString
+          - '.'
+          - !GetAtt CallLambdaGetHostedZoneName.ZoneName
+  OpenShiftApiUrl:
+    Description: Url to login to OpenShift Api
+    Value: 
+      'Fn::Join':
+        - ''
+        - - 'https://api.masocp-'
+          - !GetAtt CallLambdaRandomizer.Lower_RandomString
+          - '.'
+          - !GetAtt CallLambdaGetHostedZoneName.ZoneName
+  OpenShiftUser:
+    Description: Username to login to OpenShift consple
+    Value: 'masocpuser'
+  OpenShiftPassword:
+    Description: Username to login to OpenShift consple
+    Value:
+      'Fn::Join':
+        - ''
+        - - 'masocp'
+          - !GetAtt CallLambdaRandomizer.Lower_RandomString
+          - 'pass'
+  MASAdminUrl:
+    Description: Url to login to MAS Admin UI
+    Value: 
+      'Fn::Join':
+        - ''
+        - - 'https://admin.masdev1.apps.masocp-'
+          - !GetAtt CallLambdaRandomizer.Lower_RandomString
+          - '.'
+          - !GetAtt CallLambdaGetHostedZoneName.ZoneName
+  MASUrl:
+    Description: Url to login to MAS UI
+    Value: 
+      'Fn::Join':
+        - ''
+        - - 'https://wsdemo.home.masdev1.apps.masocp-'
+          - !GetAtt CallLambdaRandomizer.Lower_RandomString
+          - '.'
+          - !GetAtt CallLambdaGetHostedZoneName.ZoneName
+  MASCredentials:
+    Description: Username and password to login to MAS UI
+    Value: <Get it from OCP secret 'masdev1-credentials-superuser' in namespace 'mas-masdev1-core'>
+  BASUrl:
+    Description: Url to login to MAS Workspace UI
+    Value: 
+      'Fn::Join':
+        - ''
+        - - 'https://dashboard-ibm-bas.apps.masocp-'
+          - !GetAtt CallLambdaRandomizer.Lower_RandomString
+          - '.'
+          - !GetAtt CallLambdaGetHostedZoneName.ZoneName
+  BASCredentials:
+    Description: Username and password to login to BAS UI
+    Value: <BAS uses OpenShift authentication>

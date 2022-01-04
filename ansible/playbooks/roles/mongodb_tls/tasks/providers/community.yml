@@ -1,0 +1,267 @@
+---
+
+# 0. Validate required properties
+# -----------------------------------------------------------------------------
+- name: "mongodb/community : Fail if mongodb_storage_class is not provided"
+  when: mongodb_storage_class is not defined or mongodb_storage_class == ""
+  fail:
+    msg: "mongodb_storage_class property is required"
+
+- name: "mongodb/community : Fail if mongodb_storage_capacity_data is not provided"
+  when: mongodb_storage_capacity_data is not defined or mongodb_storage_capacity_data == ""
+  fail:
+    msg: "mongodb_storage_capacity_data property is required"
+
+- name: "mongodb/community : Fail if mongodb_storage_capacity_logs is not provided"
+  when: mongodb_storage_capacity_logs is not defined or mongodb_storage_capacity_logs == ""
+  fail:
+    msg: "mongodb_storage_capacity_logs property is required"
+
+- name: "mongodb/community : Fail if mas_instance_id is not provided"
+  when: mas_instance_id is not defined or mas_instance_id == ""
+  fail:
+    msg: "mas_instance_id property is required"
+
+- name: "mongodb/community : Debug properties"
+  debug:
+    msg:
+      - "MongoDb namespace ............ {{ mongodb_namespace }}"
+      - "MongoDb storage class ........ {{ mongodb_storage_class }}"
+      - "MongoDb data capacity ........ {{ mongodb_storage_capacity_data }}"
+      - "MongoDb logs capacity ........ {{ mongodb_storage_capacity_logs }}"
+      - "MAS instance ID .............. {{ mas_instance_id }}"
+      - "MAS config directory ......... {{ mas_config_dir }}"
+
+
+# 1. Install the CRD
+# -----------------------------------------------------------------------------
+- name: "mongodb/community : Install MongoDBCommunity CRD"
+  community.kubernetes.k8s:
+    apply: yes
+    definition: "{{ lookup('template', 'templates/community/crd.yml') }}"
+
+
+# 2. Create namespace & install RBAC
+# -----------------------------------------------------------------------------
+- name: "mongodb/community : Create namespace & install RBAC"
+  community.kubernetes.k8s:
+    apply: yes
+    definition: "{{ lookup('template', 'templates/community/rbac.yml') }}"
+
+
+# 3. Configure anyuid permissions in the MongoDb namespace
+# -----------------------------------------------------------------------------
+- name: "mongodb/community : Configure anyuid permissions in the MongoDb namespace"
+  shell: |
+    oc adm policy add-scc-to-user anyuid system:serviceaccount:{{ mongodb_namespace }}:default
+    oc adm policy add-scc-to-user anyuid system:serviceaccount:{{ mongodb_namespace }}:mongodb-kubernetes-operator
+
+
+# 4. Install the operator
+# -----------------------------------------------------------------------------
+- name: "mongodb/community : Install the MongoDb Operator"
+  community.kubernetes.k8s:
+    apply: yes
+    definition: "{{ lookup('template', 'templates/community/manager.yml') }}"
+
+
+# 5. Configure TLS using cert manager
+# -----------------------------------------------------------------------------
+
+#This task will create ClusterIssuer and wait till it gets ready 
+- name : "Create a cluster issuer "
+  community.kubernetes.k8s:
+    apply: yes
+    definition: "{{ lookup('template', 'templates/community/cluster-issuer.yml') }}"
+    wait: yes
+    wait_condition:
+      status: 'True'
+      type: Ready
+
+#Task to create a CA-Cert in namespace which can be used as root CA for other certificates in same NS 
+- name : "Create a ca certificate in {{ mongodb_namespace }}"
+  community.kubernetes.k8s:
+    apply: yes
+    definition: "{{ lookup('template', 'templates/community/ca-cert.yml') }}"
+    wait: yes
+    wait_condition:
+      status: 'True'
+      type: Ready
+
+#Taks to create issuer in namespace which will be used to create other application related certificates 
+- name : "Create a issuer  in {{ mongodb_namespace }}"
+  community.kubernetes.k8s:
+    apply: yes
+    definition: "{{ lookup('template', 'templates/community/issuer.yml') }}"
+    wait: yes
+    wait_condition:
+      status: 'True'
+      type: Ready
+
+#Server certificate
+- name : "Create a server certificate in {{ mongodb_namespace }}"
+  community.kubernetes.k8s:
+    apply: yes
+    definition: "{{ lookup('template', 'templates/community/server-cert.yml') }}"
+    wait: yes
+    wait_condition:
+      status: 'True'
+      type: Ready
+
+#Client certificate
+- name : "Create a client certificate  in {{ mongodb_namespace }}"
+  community.kubernetes.k8s:
+    apply: yes
+    definition: "{{ lookup('template', 'templates/community/client-cert.yml') }}"
+    wait: yes
+    wait_condition:
+      status: 'True'
+      type: Ready
+
+#Taking ca.crt value in a variable 
+#Mongo needs a configmap having ca.crt value
+- name: "mongodb/community : Lookup the ca.crt"
+  community.kubernetes.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: mongo-server-cert
+    namespace: "{{mongodb_namespace}}"
+  register: mongodb_ca_lookup
+
+#Check if configmap exists 
+- name: "mongodb/community : Check for existing CA configmap"
+  community.kubernetes.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    name: mas-mongo-ce-cert-map
+    namespace: "{{ mongodb_namespace }}"
+  register: ca_cfgmap_info
+
+#Creating a ca.crt configmap which will be consumed by mongo cr
+
+- name: "mongodb/community : Create new ca configmap"
+  when:
+    - ca_cfgmap_info.resources is defined
+    - ca_cfgmap_info.resources | length == 0
+  vars:
+    mongodb_ca_crt: "{{ mongodb_ca_lookup.resources[0].data['ca.crt'] | b64decode }}"
+  community.kubernetes.k8s:
+    apply: yes
+    definition: "{{ lookup('template', 'templates/community/tls.yml') }}"
+
+
+
+# 6. Create MongoDb admin user credentials secret
+# -----------------------------------------------------------------------------
+- name: "mongodb/community : Check for existing user password secret"
+  community.kubernetes.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: mas-mongo-ce-admin-password
+    namespace: "{{ mongodb_namespace }}"
+  register: admin_password_info
+
+- name: "mongodb/community : Create new MongoDb admin user credentials secret"
+  when:
+    - admin_password_info.resources is defined
+    - admin_password_info.resources | length == 0
+  community.kubernetes.k8s:
+    apply: yes
+    definition: "{{ lookup('template', 'templates/community/admin-password.yml') }}"
+
+
+# 7. Deploy the cluster
+# -----------------------------------------------------------------------------
+- name: "mongodb/community : Create MongoDb cluster"
+  community.kubernetes.k8s:
+    apply: yes
+    definition: "{{ lookup('template', 'templates/community/cr.yml') }}"
+
+
+# 8. Wait for the cluster to be ready
+# -----------------------------------------------------------------------------
+- name: "mongodb/community : Wait for stateful set to be ready"
+  community.kubernetes.k8s_info:
+    api_version: apps/v1
+    kind: StatefulSet
+    name: mas-mongo-ce
+    namespace: "{{ mongodb_namespace }}"
+  register: mongodb_statefulset
+  retries: 30 # 30 * 30 seconds = 15 minutes
+  delay: 30
+  until:
+    - mongodb_statefulset.resources | length > 0
+    - mongodb_statefulset.resources[0].status.readyReplicas is defined
+    - mongodb_statefulset.resources[0].status.readyReplicas == 3
+
+# 9. Create MAS MongoCfg
+# -----------------------------------------------------------------------------
+
+# Lookup the admin password that was used
+- name: "mongodb/community : Lookup admin password"
+  community.kubernetes.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: mas-mongo-ce-admin-admin
+    namespace: "{{ mongodb_namespace }}"
+  register: admin_password_lookup
+  retries: 30 # 30 * 30 seconds = 15 minutes
+  delay: 30
+  until:
+    - admin_password_lookup.resources | length > 0
+    - admin_password_lookup.resources[0].data.password is defined
+
+# Lookup the CA CRT configmap 
+- name: "mongodb/community : Lookup the ca.crt"
+  community.kubernetes.k8s_info:
+    api_version: v1
+    kind: ConfigMap
+    name: mas-mongo-ce-cert-map
+    namespace: "{{ mongodb_namespace }}"
+  register: mongodb_ca_lookup
+
+# Lookup the server certificate
+- name: "mongodb/community : Lookup the server.crt"
+  community.kubernetes.k8s_info:
+    api_version: v1
+    kind: Secret
+    name: mongo-server-cert
+    namespace: "{{ mongodb_namespace }}"
+  register: mongodb_crt_lookup
+
+- name: "mongodb/community : Create MAS MongoCfg (debug)"
+  debug:
+    msg:
+      - "ca.crt ...................... {{ mongodb_ca_lookup.resources[0].data['ca.crt'] }}"
+      - "tls.crt ..................... {{ mongodb_crt_lookup.resources[0].data['tls.crt'] | b64decode }}"
+
+# Create MAS_CONFIG_DIR
+- name: Create MAS config dir
+  file:
+    path: "{{ mas_config_dir }}"
+    state: directory
+    mode: "744"
+  become: false
+
+
+- name: "mongodb/community : Create MAS MongoCfg (debug)"
+  debug:
+    msg: "{{ lookup('template', 'templates/community/suite_mongocfg.yml') }}"
+  vars:
+    mongodb_ca_pem: "{{ mongodb_ca_lookup.resources[0].data['ca.crt'] }}"
+    mongodb_server_crt: "{{ mongodb_crt_lookup.resources[0].data['tls.crt'] | b64decode }}"
+    mongodb_admin_password: "{{ admin_password_lookup.resources[0].data.password | b64decode }}"
+
+- name: "mongodb/community : Create MAS MongoCfg"
+  when:
+    - mas_instance_id is defined
+    - mas_instance_id != ""
+    - mas_config_dir is defined
+    - mas_config_dir != ""
+  ansible.builtin.template:
+    src: community/suite_mongocfg.yml
+    dest: "{{ mas_config_dir }}/mongo-{{ mongodb_namespace }}.yml"
+  vars:
+    mongodb_ca_pem: "{{ mongodb_ca_lookup.resources[0].data['ca.crt'] }}"
+    mongodb_server_crt: "{{ mongodb_crt_lookup.resources[0].data['tls.crt'] | b64decode }}"
+    mongodb_admin_password: "{{ admin_password_lookup.resources[0].data.password | b64decode }}"

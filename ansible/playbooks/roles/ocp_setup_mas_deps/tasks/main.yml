@@ -1,0 +1,154 @@
+---
+# -----------------------------------------------------------------------------
+#       Change default upgrade mode of OCP to manual
+# -----------------------------------------------------------------------------
+
+#Getting cluster version details 
+- name: "Get ocp cluster version details "
+  k8s_info:
+    kind: ClusterVersion
+    name: version
+  register: cluster_details
+#Print cluster id 
+- name: Print cluster id 
+  debug:
+    msg: "clusterID : {{ cluster_details.resources[0].spec.clusterID }}"
+
+#Task to update ClusterVersionDefinition of OCP cluster
+
+#Removed desiredUpdate, updatechannel   
+- name : Set Cluster Version Definition
+  vars:
+    clusterID: "{{ cluster_details.resources[0].spec.clusterID }}"
+  community.kubernetes.k8s:
+    apply: yes
+    force: yes
+    state: present
+    definition: "{{ lookup('template', 'templates/cluster-version.yml') }}"
+
+# -----------------------------------------------------------------------------
+# 1. Install IBM catalogs
+# -----------------------------------------------------------------------------
+- name: "Create IBM catalogs"
+  community.kubernetes.k8s:
+    definition: "{{ lookup('template', 'templates/ibm-catalogs.yaml') }}"
+
+# 2. Install development (pre-release) catalogs
+# -----------------------------------------------------------------------------
+- name: "Install development (pre-release) catalogs"
+  when:
+    - artifactory_username is defined
+    - artifactory_username != ""
+    - artifactory_apikey is defined
+    - artifactory_apikey != ""
+    - airgap_install is not defined or not airgap_install
+  include_tasks: "tasks/development-catalogs.yml"
+
+# 3. Install cert-manager
+# -----------------------------------------------------------------------------
+#check if cert manager is installed on the cluster 
+- name: Check if Cert Manager is already installed
+  community.kubernetes.k8s_info:
+    api_version: v1
+    name: cert-manager
+    namespace: "cert-manager"
+    kind: Deployment
+  register: _cert_manager_deployed
+
+# TODO: Version check existing installation, ensure at least 1.2 is installed
+#       Fail if version < 1.2 is installed
+
+- name: Deploy Cert Manager
+  shell: |
+    oc create namespace cert-manager
+    oc apply -f https://github.com/jetstack/cert-manager/releases/download/v1.2.0/cert-manager.yaml
+  when: (_cert_manager_deployed.resources | length) == 0
+
+
+# 4. Install Service Binding Operator
+# -----------------------------------------------------------------------------
+# Important
+# Do not upgrade to SBO 0.9.0, there are breaking changes in the API that
+# are incompatible with MAS
+
+# -----------------------------------------------------------------------------
+# Check if SBO operator is installed already 
+# -----------------------------------------------------------------------------
+
+#  Get SBO operator information
+
+- name: "Check if SBO is installed "
+  k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: ClusterServiceVersion
+    name: service-binding-operator.v0.8.0
+    namespace: openshift-operators
+  register: sbo_details
+
+
+
+- name: Create SBO Subscription
+  community.kubernetes.k8s:
+    template: templates/sbo/subscription.yaml
+    wait: yes
+    wait_timeout: 120
+  when: (sbo_details.resources | length) == 0
+
+- name: Lookup SBO install plan
+  community.kubernetes.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: InstallPlan
+    namespace: openshift-operators
+    label_selectors:
+      - operators.coreos.com/rh-service-binding-operator.openshift-operators
+  when: (sbo_details.resources | length) == 0
+  register: sbo_installplan_info
+  retries: 20
+  delay: 60 # Retry for approx 20 minutes (60s * 20 attempts) before giving up
+  until: sbo_installplan_info.resources | length > 0
+
+- name: Approve the install plan for SBO
+  when:
+    - (sbo_details.resources | length) == 0
+    - sbo_installplan_info.resources[0].status.phase != "Complete"
+    - sbo_installplan_info.resources[0].spec.clusterServiceVersionNames[0] == "service-binding-operator.v0.8.0"
+  community.kubernetes.k8s:
+    definition:
+      apiVersion: operators.coreos.com/v1alpha1
+      kind: InstallPlan
+      metadata:
+        name: "{{ sbo_installplan_info.resources[0].metadata.name }}"
+        namespace: openshift-operators
+      spec:
+        approved: true
+
+- name: Wait for SBO install to complete
+  when:
+    - (sbo_details.resources | length) == 0
+    - sbo_installplan_info.resources[0].status.phase != "Complete"
+    - sbo_installplan_info.resources[0].spec.clusterServiceVersionNames[0] == "service-binding-operator.v0.8.0"
+  community.kubernetes.k8s_info:
+    api_version: operators.coreos.com/v1alpha1
+    kind: InstallPlan
+    name: "{{ sbo_installplan_info.resources[0].metadata.name }}"
+    namespace: openshift-operators
+  register: sbo_installplan_info
+  retries: 20
+  delay: 30 # Retry for approx 10 minutes (20s * 30 attempts) before giving up
+  until:
+    - sbo_installplan_info.resources[0].status.phase is defined
+    - sbo_installplan_info.resources[0].status.phase == "Complete"
+
+
+# 5. Enable monitoring for user-defined projects
+# https://docs.openshift.com/container-platform/4.6/monitoring/enabling-monitoring-for-user-defined-projects.html
+# -----------------------------------------------------------------------------
+# - name: Enable monitoring for user-defined projects
+#   community.kubernetes.k8s:
+#     definition: "{{ lookup('template', 'templates/cluster-monitoring/configmap.yaml') }}"
+#     wait: yes
+#     wait_timeout: 120
+
+
+# 6. TODO: Install and configure grafana
+# See: https://github.com/ibm-watson-iot/iot-docs/tree/master/monitoring

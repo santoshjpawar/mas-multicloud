@@ -1,0 +1,35 @@
+---
+# 1. Check for undefined properties that do not have a default
+# -----------------------------------------------------------------------------
+# - name: "Debug cluter name "
+#   debug: 
+#     msg: "{{cluster_type}}"
+
+# - name: "Debug supported cluster types "
+#   debug: 
+#     msg: "{{supported_cluster_types}}"
+
+
+- name: "Fail if type is not provided"
+  when: cluster_type is not defined or cluster_type == ""
+  fail:
+    msg: "cluster_type property is required"
+
+- name: "Fail if cluster_type is not supported"
+  fail:
+    msg: "cluster_type '{{ cluster_type }}' property is not supported by this role"
+  when: cluster_type not in supported_cluster_types
+  
+
+# 2. Provide debug info
+# -----------------------------------------------------------------------------
+- debug:
+    msg:
+      - "Cluster name ................. {{ cluster_name }}"
+      - "Cluster type ................. {{ cluster_type }}"
+
+
+# 3. Perform login
+# -----------------------------------------------------------------------------
+- include_tasks: "tasks/login-{{ cluster_type }}.yml"
+  when: cluster_type != 'in-cluster'

@@ -1,0 +1,3 @@
+---
+mongodb_namespace: mongo-cert-manager-test
+mongodb_cfg_file: /tmp/mongodb-mongoce-system.yaml
